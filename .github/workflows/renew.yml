@@ -1,9 +1,8 @@
 name: XServer-Vmail-VPS
-
 on:
   workflow_dispatch:
   #schedule:
-  #  - cron: '0 1 * * *'   # 每天 UTC 01:00（北京时间 09:00）
+  #  - cron: '33 0 * * *'
 
 jobs:
   run_xserver_renew:
@@ -28,7 +27,51 @@ jobs:
         with:
           python-version: '3.10'
 
+      # ✅ 核心：绝对稳定的隔天执行（不受时间偏移影响）
+      - name: ⏱️ 执行频率控制（稳定版）
+        id: check_time
+        run: |
+          echo "==== 时间判断开始 ===="
+
+          # 固定起点（UTC）
+          START_TIME=$(date -u -d "2026-03-21 01:00" +%s)
+          NOW=$(date +%s)
+
+          DIFF=$((NOW - START_TIME))
+
+          echo "当前 UTC 时间: $(date -u)"
+          echo "当前时间戳: $NOW"
+          echo "起始时间戳: $START_TIME"
+          echo "差值: $DIFF 秒"
+
+          # 未到起始时间
+          if [ $DIFF -lt 0 ]; then
+            echo "⏭️ 未到起始时间"
+            echo "run=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # 转换为天数（关键！稳定核心）
+          DAYS=$((DIFF / 86400))
+
+          echo "已过去天数: $DAYS"
+
+          # 隔天执行
+          if (( DAYS % 2 != 0 )); then
+            echo "⏭️ 今天不是执行日（隔天规则）"
+            echo "run=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "✅ 今天是执行日"
+          echo "run=true" >> $GITHUB_OUTPUT
+
+      # =========================
+      # 以下步骤仅在 run=true 时执行
+      # =========================
+
       - name: 🛡️ 启动 Gost 代理转发
+        if: steps.check_time.outputs.run == 'true'
         run: |
           echo "启动 Gost..."
 
@@ -45,6 +88,7 @@ jobs:
           echo ""
 
       - name: 🛠️ 安装系统依赖
+        if: steps.check_time.outputs.run == 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -55,12 +99,14 @@ jobs:
             scrot
 
       - name: 🐍 安装 Python 依赖
+        if: steps.check_time.outputs.run == 'true'
         run: |
           pip install --upgrade pip
           pip install seleniumbase
           seleniumbase install chromedriver
 
       - name: 🚀 运行续费脚本
+        if: steps.check_time.outputs.run == 'true'
         env:
           PYTHONIOENCODING: utf-8
           XSERVER_ACCOUNT: ${{ secrets.XSERVER_ACCOUNT }}
@@ -70,8 +116,8 @@ jobs:
           echo "开始执行 renew.py..."
           xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python renew.py
 
-      - name: 📸 上传截图
-        if: always()
+      - name: 📸 上传截图（仅执行时）
+        if: always() && steps.check_time.outputs.run == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: debug-screenshots
