@@ -34,7 +34,7 @@ jobs:
           echo "==== 时间判断开始 ===="
 
           # 固定起点（UTC）
-          START_TIME=$(date -u -d "2026-03-21 01:00" +%s)
+          START_TIME=$(date -u -d "2026-03-22 01:00" +%s)
           NOW=$(date +%s)
 
           DIFF=$((NOW - START_TIME))
