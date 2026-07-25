@@ -1,17 +1,11 @@
-name: XServer-Vmail-VPS
+name: XServer-VPS
 on:
   workflow_dispatch:
-  #schedule:
-  #  - cron: '33 0 * * *'
 
 jobs:
   run_xserver_renew:
     runs-on: ubuntu-latest
-
     steps:
-      - name: 📥 下载公库代码
-        uses: actions/checkout@v4
-
       - name: 📥 下载私库脚本
         uses: actions/checkout@v4
         with:
@@ -27,68 +21,75 @@ jobs:
         with:
           python-version: '3.10'
 
-      # ✅ 核心：绝对稳定的隔天执行（不受时间偏移影响）
-      - name: ⏱️ 执行频率控制（稳定版）
-        id: check_time
+      - name: 🛡️ 启动 GOST 代理转发
+        if: ${{ env.GOST_PROXY != '' }}
+        env:
+          GOST_PROXY: ${{ secrets.GOST_PROXY }}
         run: |
-          echo "==== 时间判断开始 ===="
-
-          # 固定起点（UTC）
-          START_TIME=$(date -u -d "2026-03-22 01:00" +%s)
-          NOW=$(date +%s)
-
-          DIFF=$((NOW - START_TIME))
-
-          echo "当前 UTC 时间: $(date -u)"
-          echo "当前时间戳: $NOW"
-          echo "起始时间戳: $START_TIME"
-          echo "差值: $DIFF 秒"
-
-          # 未到起始时间
-          if [ $DIFF -lt 0 ]; then
-            echo "⏭️ 未到起始时间"
-            echo "run=false" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-
-          # 转换为天数（关键！稳定核心）
-          DAYS=$((DIFF / 86400))
-
-          echo "已过去天数: $DAYS"
-
-          # 隔天执行
-          if (( DAYS % 2 != 0 )); then
-            echo "⏭️ 今天不是执行日（隔天规则）"
-            echo "run=false" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-
-          echo "✅ 今天是执行日"
-          echo "run=true" >> $GITHUB_OUTPUT
-
-      # =========================
-      # 以下步骤仅在 run=true 时执行
-      # =========================
-
-      - name: 🛡️ 启动 Gost 代理转发
-        if: steps.check_time.outputs.run == 'true'
-        run: |
-          echo "启动 Gost..."
-
-          wget https://github.com/ginuerzh/gost/releases/download/v2.11.5/gost-linux-amd64-2.11.5.gz
-          gunzip gost-linux-amd64-2.11.5.gz
-          chmod +x gost-linux-amd64-2.11.5
-          mv gost-linux-amd64-2.11.5 gost
-
-          nohup ./gost -L http://:8080 -F ${{ secrets.GOST_PROXY }} > gost.log 2>&1 &
+          VERSION=$(curl -s https://api.github.com/repos/ginuerzh/gost/releases/latest \
+            | grep '"tag_name"' | cut -d'"' -f4 | tr -d 'v')
+          echo "📦 GOST 版本: $VERSION"
+          wget -q "https://github.com/ginuerzh/gost/releases/download/v${VERSION}/gost_${VERSION}_linux_amd64.tar.gz"
+          tar -xzf "gost_${VERSION}_linux_amd64.tar.gz"
+          chmod +x gost
+          nohup ./gost -L http://:8080 -F "$GOST_PROXY" > gost.log 2>&1 &
           sleep 3
+          echo "✅ GOST 已启动，测试连通性..."
+          if curl -s -x http://127.0.0.1:8080 https://api.ipify.org \
+              | sed -E 's/([0-9]+\.[0-9]+\.)[0-9]+\.[0-9]+/\1**.**/g' && echo; then
+            echo "GOST_OK=true" >> $GITHUB_ENV
+          else
+            echo "⚠️ GOST 连通性测试失败"
+            echo "GOST_OK=false" >> $GITHUB_ENV
+          fi
 
-          echo "测试代理 IP..."
-          curl -x http://127.0.0.1:8080 https://api.ipify.org
-          echo ""
+      - name: ⚠️ GOST 失败写回 Cron 5分钟后重试
+        if: ${{ env.GOST_OK == 'false' }}
+        env:
+          CRON_JOB: ${{ secrets.CRON_JOB }}
+          TG_BOT: ${{ secrets.TG_BOT }}
+        run: |
+          python3 - <<'EOF'
+          import os, json, urllib.request, urllib.parse, datetime
+          from datetime import timedelta
+
+          cron_job = os.environ.get("CRON_JOB", "")
+          if not cron_job or "," not in cron_job:
+              print("⚠️ 未配置 CRON_JOB，跳过")
+              exit(0)
+
+          api_key, job_id = [x.strip() for x in cron_job.split(",", 1)]
+          next_run = datetime.datetime.utcnow() + timedelta(hours=8, minutes=5)
+
+          data = {"job": {"schedule": {
+              "timezone": "Asia/Shanghai", "expiresAt": 0,
+              "hours": [next_run.hour], "minutes": [next_run.minute],
+              "mdays": [next_run.day], "months": [next_run.month], "wdays": [-1],
+          }}}
+          payload = json.dumps(data).encode()
+          req = urllib.request.Request(
+              f"https://api.cron-job.org/jobs/{job_id}",
+              data=payload,
+              headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+              method="PATCH"
+          )
+          urllib.request.urlopen(req, timeout=15)
+          print(f"🔁 GOST 失败，已写回 Cron：{next_run.month:02d}月{next_run.day:02d}日 {next_run.hour:02d}:{next_run.minute:02d} 重试")
+
+          tg_bot = os.environ.get("TG_BOT", "")
+          if tg_bot and "," in tg_bot:
+              chat_id, token = [x.strip() for x in tg_bot.split(",", 1)]
+              msg = "⚠️ GOST 代理启动失败，已安排5分钟后重试"
+              urllib.request.urlopen(
+                  f"https://api.telegram.org/bot{token}/sendMessage",
+                  data=urllib.parse.urlencode({"chat_id": chat_id, "text": msg}).encode(),
+                  timeout=10
+              )
+              print("📨 TG 推送成功")
+          EOF
 
       - name: 🛠️ 安装系统依赖
-        if: steps.check_time.outputs.run == 'true'
+        if: ${{ env.GOST_OK != 'false' }}
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -99,26 +100,31 @@ jobs:
             scrot
 
       - name: 🐍 安装 Python 依赖
-        if: steps.check_time.outputs.run == 'true'
+        if: ${{ env.GOST_OK != 'false' }}
         run: |
-          pip install --upgrade pip
           pip install seleniumbase
           seleniumbase install chromedriver
 
-      - name: 🚀 运行续费脚本
-        if: steps.check_time.outputs.run == 'true'
+      - name: 🚀 运行脚本
+        if: ${{ env.GOST_OK != 'false' }}
         env:
           PYTHONIOENCODING: utf-8
           XSERVER_ACCOUNT: ${{ secrets.XSERVER_ACCOUNT }}
           GOST_PROXY: ${{ secrets.GOST_PROXY }}
           TG_BOT: ${{ secrets.TG_BOT }}
+          CRON_JOB: ${{ secrets.CRON_JOB }}
         run: |
-          echo "开始执行 renew.py..."
           xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python renew.py
 
-      - name: 📸 上传截图（仅执行时）
-        if: always() && steps.check_time.outputs.run == 'true'
+      - name: 📸 上传截图
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: debug-screenshots
           path: "*.png"
+
+      - name: 🧽 清理临时文件
+        if: always()
+        run: |
+          pkill -f "gost -L" || true
+          rm -f gost gost_*.tar.gz gost.log renew.py || true
